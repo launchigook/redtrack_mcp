@@ -12,10 +12,13 @@ import { runTool, getReport } from './redtrack.mjs';
 // ────────────────────────────────────────────────────────────────────────────
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT  = process.env.TELEGRAM_CHAT_ID;
-const REPORT_CAMPAIGN_ID  = process.env.REPORT_CAMPAIGN_ID || '69ce350453a286805398f9a5';
-const REPORT_GROUP        = process.env.REPORT_GROUP || 'sub3,sub6';
+// REPORT_CAMPAIGN_ID is optional now — leave empty to report ALL campaigns.
+const REPORT_CAMPAIGN_ID  = process.env.REPORT_CAMPAIGN_ID || '';
+const REPORT_GROUP        = process.env.REPORT_GROUP || 'campaign';
 const REPORT_TIMEZONE     = process.env.REPORT_TIMEZONE || 'America/New_York';
 const REPORT_INTERVAL_MIN = parseInt(process.env.REPORT_INTERVAL_MIN || '15', 10);
+// Cap rows shown per section so the Telegram message stays under the 4096-char limit.
+const REPORT_MAX_PER_SECTION = parseInt(process.env.REPORT_MAX_PER_SECTION || '10', 10);
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -31,20 +34,26 @@ function timeInTZ(tz) {
 async function sendTelegramReport() {
   try {
     const today = todayInTZ(REPORT_TIMEZONE);
-    const rows = await getReport({
+    const args = {
       group: REPORT_GROUP,
       date_from: today,
       date_to: today,
-      campaign_id: REPORT_CAMPAIGN_ID,
       timezone: REPORT_TIMEZONE,
       sortby: 'profit',
       direction: 'desc'
-    });
+    };
+    if (REPORT_CAMPAIGN_ID) args.campaign_id = REPORT_CAMPAIGN_ID;
+    const rows = await getReport(args);
 
     const list = Array.isArray(rows) ? rows : [];
     const num = v => Number(v) || 0;
+    // Keep only rows with any meaningful activity — most campaigns have $0 spend
+    // and 0 conv (e.g. organic-only) and would just be noise.
+    const active = list.filter(r => num(r.cost) > 0 || num(r.conversions) > 0 || num(r.revenue) > 0);
+
+    // Account-wide totals (across the active set).
     let tc = 0, tconv = 0, trev = 0, tprof = 0, tclk = 0;
-    for (const r of list) {
+    for (const r of active) {
       tc += num(r.cost); tconv += num(r.conversions); trev += num(r.revenue);
       tprof += num(r.profit); tclk += num(r.clicks);
     }
@@ -52,30 +61,46 @@ async function sendTelegramReport() {
     const aov = tconv ? trev / tconv : 0;
     const roi = tc ? (tprof / tc) * 100 : 0;
 
-    const profitable = list.filter(r => num(r.profit) > 0.005).slice(0, 3);
-    const losses = list.filter(r => num(r.profit) < -0.005)
-      .sort((a, b) => num(a.profit) - num(b.profit)).slice(0, 3);
-    const label = r => escapeHtml(trim(r.sub6 || r.sub3 || '(untagged)', 50));
+    const profitable = active.filter(r => num(r.profit) > 0.005)
+      .sort((a, b) => num(b.profit) - num(a.profit));
+    const losses = active.filter(r => num(r.profit) < -0.005)
+      .sort((a, b) => num(a.profit) - num(b.profit));
+
+    // Row label: prefer campaign name; fall back to sub6/sub3/campaign_id for other groupings.
+    const label = r => escapeHtml(trim(
+      r.campaign || r.campaign_name || r.sub6 || r.sub3 || r.campaign_id || '(untagged)',
+      55
+    ));
+    const rowLine = (r) => {
+      const p = num(r.profit), c = num(r.cost), conv = num(r.conversions);
+      const sign = p >= 0 ? '+' : '';
+      const cplStr = conv ? ` · CPL $${(c / conv).toFixed(2)}` : '';
+      return `• ${label(r)}: <b>$${sign}${p.toFixed(2)}</b> ($${c.toFixed(2)} · ${conv | 0} conv${cplStr})`;
+    };
+    const renderSection = (title, arr) => {
+      if (!arr.length) return '';
+      const shown = arr.slice(0, REPORT_MAX_PER_SECTION);
+      const extra = arr.length - shown.length;
+      let s = `\n${title} (${arr.length})\n` + shown.map(rowLine).join('\n');
+      if (extra > 0) s += `\n… +${extra} aur`;
+      return s + '\n';
+    };
 
     const time = timeInTZ(REPORT_TIMEZONE);
     let msg;
-    if (!list.length || (tclk === 0 && tconv === 0 && tc === 0)) {
-      msg = `📊 ${today} ${time} ${REPORT_TIMEZONE}\nAbhi tak koi activity nahi today.`;
+    if (!active.length) {
+      msg = `📊 ${today} ${time} ${REPORT_TIMEZONE}\nAbhi tak koi paid activity nahi today.`;
     } else {
       const sign = n => (n >= 0 ? '+' : '');
       const emoji = tprof >= 0 ? '🟢' : '🔴';
-      msg  = `📊 <b>Campaign report</b> · ${today} ${time} ${REPORT_TIMEZONE}\n`;
-      msg += `Spend <b>$${tc.toFixed(2)}</b> | Conv <b>${tconv | 0}</b> | Rev <b>$${trev.toFixed(2)}</b>\n`;
-      msg += `${emoji} Profit <b>$${sign(tprof)}${tprof.toFixed(2)}</b> | ROI ${sign(roi)}${roi.toFixed(0)}% | CPL $${cpl.toFixed(2)} | AOV $${aov.toFixed(2)}\n`;
-      if (profitable.length) {
-        msg += `\n🟢 <b>Top profitable</b>\n`;
-        for (const r of profitable) msg += `• ${label(r)}: +$${num(r.profit).toFixed(2)} (${num(r.conversions) | 0} conv)\n`;
-      }
-      if (losses.length) {
-        msg += `\n🔴 <b>Top losses</b>\n`;
-        for (const r of losses) msg += `• ${label(r)}: $${num(r.profit).toFixed(2)} ($${num(r.cost).toFixed(2)} spend)\n`;
-      }
+      msg  = `📊 <b>All Campaigns</b> · ${today} ${time} ${REPORT_TIMEZONE}\n`;
+      msg += `<b>Account:</b> spend $${tc.toFixed(2)} · conv ${tconv | 0} · rev $${trev.toFixed(2)}\n`;
+      msg += `${emoji} Profit <b>$${sign(tprof)}${tprof.toFixed(2)}</b> · ROI ${sign(roi)}${roi.toFixed(0)}% · CPL $${cpl.toFixed(2)} · AOV $${aov.toFixed(2)}\n`;
+      msg += renderSection('🟢 <b>Profitable</b>', profitable);
+      msg += renderSection('🔴 <b>Loss — consider pausing</b>', losses);
     }
+    // Telegram hard limit is 4096 chars; trim safely if we ever exceed.
+    if (msg.length > 4000) msg = msg.slice(0, 3990) + '\n… (truncated)';
 
     const rsp = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: 'POST',
@@ -85,7 +110,7 @@ async function sendTelegramReport() {
     if (!rsp.ok) {
       console.error('Telegram send failed:', rsp.status, (await rsp.text()).slice(0, 300));
     } else {
-      console.log(`Telegram report sent: ${list.length} rows, profit $${tprof.toFixed(2)}`);
+      console.log(`Telegram report sent: ${active.length} active campaigns, profit $${tprof.toFixed(2)}`);
     }
   } catch (err) {
     console.error('sendTelegramReport error:', err.message);
