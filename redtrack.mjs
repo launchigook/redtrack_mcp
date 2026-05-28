@@ -70,6 +70,43 @@ export async function getConversions({ startDate, endDate }) {
   return rsp.json();
 }
 
+// Query params accepted by RedTrack GET /report (besides api_key).
+const REPORT_PARAMS = [
+  'group', 'date_from', 'date_to', 'tracks_view', 'timezone', 'time_interval',
+  'campaign_id', 'source_id', 'offer_id', 'landing_id', 'network_id',
+  'rt_source', 'rt_medium', 'rt_campaign', 'rt_adgroup', 'rt_ad',
+  'rt_placement', 'rt_keyword',
+  'page', 'per', 'total', 'sortby', 'direction', 'fields',
+  ...Array.from({ length: 20 }, (_, i) => `sub${i + 1}`)
+];
+
+/**
+ * Aggregated report grouped by one or more dimensions (e.g. sub3, sub6).
+ * Returns pre-aggregated stats per group straight from RedTrack — fast and
+ * scoped, unlike pulling every campaign/conversion page.
+ * @param {Record<string, any>} params - any of REPORT_PARAMS; group/date_from/date_to required
+ */
+export async function getReport(params = {}) {
+  if (!process.env.REDTRACK_KEY) throw new Error('REDTRACK_KEY env var not set');
+  if (!params.group) throw new Error('"group" is required (e.g. "sub3,sub6")');
+  if (!params.date_from || !params.date_to) throw new Error('"date_from" and "date_to" are required (YYYY-MM-DD)');
+
+  const search = new URLSearchParams();
+  for (const key of REPORT_PARAMS) {
+    if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
+      search.set(key, String(params[key]));
+    }
+  }
+  search.set('api_key', process.env.REDTRACK_KEY);
+
+  const url = `${BASE}/report?${search.toString()}`;
+  const rsp = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
+  if (!rsp.ok) {
+    throw new Error(`RedTrack error ${rsp.status}`);
+  }
+  return rsp.json();
+}
+
 /**
  * MCP run dispatcher – routes tool calls to implementations.
  * @param {{tool:string,input:any}} body
@@ -86,6 +123,8 @@ export async function runTool({ tool, input }) {
       return { content: [await getConversions(input)] };
     case 'get_campaigns':
       return { content: [await getCampaigns(input)] };
+    case 'get_report':
+      return { content: [await getReport(input)] };
     default:
       throw new Error('Unknown tool');
   }

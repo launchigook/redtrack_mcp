@@ -65,6 +65,12 @@ async function processRequest(body) {
         return { jsonrpc: '2.0', id, result: { content } };
       }
       default:
+        // Notifications (e.g. notifications/cancelled) carry no id and need no
+        // result — acknowledge silently instead of erroring.
+        if (typeof body.method === 'string' && body.method.startsWith('notifications/')) {
+          console.log(`Acknowledged notification: ${body.method}`);
+          return { jsonrpc: '2.0', id, result: {} };
+        }
         throw new Error(`Unrecognised JSON-RPC method: ${body.method}`);
     }
   }
