@@ -75,7 +75,13 @@ async function sendTelegramReport() {
       const p = num(r.profit), c = num(r.cost), conv = num(r.conversions);
       const sign = p >= 0 ? '+' : '';
       const cplStr = conv ? ` · CPL $${(c / conv).toFixed(2)}` : '';
-      return `• ${label(r)}: <b>$${sign}${p.toFixed(2)}</b> ($${c.toFixed(2)} · ${conv | 0} conv${cplStr})`;
+      let line = `• ${label(r)}: <b>$${sign}${p.toFixed(2)}</b> ($${c.toFixed(2)} · ${conv | 0} conv${cplStr})`;
+      // Append the sub3 (source platform campaign/ad id) below the row when both
+      // sub3 and sub6 are present and distinct — useful when grouping by sub3,sub6.
+      if (r.sub3 && r.sub6 && r.sub3 !== r.sub6) {
+        line += `\n   <code>sub3: ${escapeHtml(r.sub3)}</code>`;
+      }
+      return line;
     };
     const renderSection = (title, arr) => {
       if (!arr.length) return '';
