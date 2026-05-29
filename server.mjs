@@ -80,13 +80,17 @@ async function sendTelegramReport() {
     const buildRowLines = (arr) => {
       const out = [];
       for (const r of arr) {
-        const p = num(r.profit), c = num(r.cost), conv = num(r.conversions) | 0;
-        const cplStr = conv ? `$${(c / conv).toFixed(2)}`.padStart(6) : '   — ';
-        const spend = `$${c.toFixed(2)}`.padStart(8);
-        out.push(`${money(p, 9)} ${String(conv).padStart(4)} ${spend} ${cplStr}  ${fitName(nameFor(r))}`);
+        const p = num(r.profit), c = num(r.cost), rev = num(r.revenue), conv = num(r.conversions) | 0;
+        const spendStr = `$${c.toFixed(2)}`.padStart(8);
+        const revStr   = `$${rev.toFixed(2)}`.padStart(8);
+        const cplStr   = conv ? `$${(c / conv).toFixed(2)}`.padStart(6) : '   — ';
+        const aovStr   = conv ? `$${(rev / conv).toFixed(2)}`.padStart(6) : '   — ';
+        out.push(`${money(p, 9)} ${String(conv).padStart(4)} ${spendStr} ${revStr} ${cplStr} ${aovStr}  ${fitName(nameFor(r))}`);
         const s3 = String(r.sub3 || ''), s6 = String(r.sub6 || '');
         if (s3 && s6 && s3 !== s6) {
-          out.push(`${' '.repeat(9 + 1 + 4 + 1 + 8 + 1 + 6 + 2)}└ ${s3}`);
+          // Indent the sub3 sub-line under the Creative column.
+          // Column widths: Profit(9)+1 Conv(4)+1 Spend(8)+1 Rev(8)+1 CPL(6)+1 AOV(6)+2 → 48
+          out.push(`${' '.repeat(48)}└ ${s3}`);
         }
       }
       return out;
@@ -105,7 +109,7 @@ async function sendTelegramReport() {
 
     // Send a section's rows as one or more <pre> messages, splitting at row
     // boundaries when the per-message char budget would be exceeded.
-    const COLUMN_HEADER = `   Profit Conv    Spend    CPL  Creative`;
+    const COLUMN_HEADER = `   Profit Conv    Spend      Rev    CPL    AOV  Creative`;
     const COLUMN_SEP    = '─'.repeat(COLUMN_HEADER.length);
     const MSG_BUDGET    = 3800; // leave headroom under Telegram's 4096-char cap
     const sendSection = async (titleHTML, rowLines, totalCount) => {
