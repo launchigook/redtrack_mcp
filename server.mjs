@@ -66,30 +66,32 @@ async function sendTelegramReport() {
     const losses = active.filter(r => num(r.profit) < -0.005)
       .sort((a, b) => num(a.profit) - num(b.profit));
 
-    // Row label: prefer campaign name; fall back to sub6/sub3/campaign_id for other groupings.
-    const label = r => escapeHtml(trim(
-      r.campaign || r.campaign_name || r.sub6 || r.sub3 || r.campaign_id || '(untagged)',
-      55
-    ));
-    const rowLine = (r) => {
-      const p = num(r.profit), c = num(r.cost), conv = num(r.conversions);
-      const sign = p >= 0 ? '+' : '';
-      const cplStr = conv ? ` · CPL $${(c / conv).toFixed(2)}` : '';
-      let line = `• ${label(r)}: <b>$${sign}${p.toFixed(2)}</b> ($${c.toFixed(2)} · ${conv | 0} conv${cplStr})`;
-      // Append the sub3 (source platform campaign/ad id) below the row when both
-      // sub3 and sub6 are present and distinct — useful when grouping by sub3,sub6.
-      if (r.sub3 && r.sub6 && r.sub3 !== r.sub6) {
-        line += `\n   <code>sub3: ${escapeHtml(r.sub3)}</code>`;
-      }
-      return line;
+    // Render rows as a monospace <pre> table so columns line up in Telegram.
+    const fitName = (s, w = 28) => {
+      s = String(s || '(untagged)').trim();
+      return s.length <= w ? s : s.slice(0, w - 1) + '…';
     };
-    const renderSection = (title, arr) => {
-      if (!arr.length) return '';
+    const money = (v, w = 8) => ((v >= 0 ? '+' : '') + `$${v.toFixed(2)}`).padStart(w);
+    const padL = (s, w) => String(s).padStart(w);
+    const nameFor = r => r.campaign || r.campaign_name || r.sub6 || r.sub3 || r.campaign_id || '';
+
+    const renderTable = (arr) => {
+      const head = `${'Profit'.padStart(9)} ${'Conv'.padStart(4)} ${'Spend'.padStart(8)} ${'CPL'.padStart(6)}  Creative`;
+      const lines = [head, '─'.repeat(head.length)];
       const shown = arr.slice(0, REPORT_MAX_PER_SECTION);
-      const extra = arr.length - shown.length;
-      let s = `\n${title} (${arr.length})\n` + shown.map(rowLine).join('\n');
-      if (extra > 0) s += `\n… +${extra} aur`;
-      return s + '\n';
+      for (const r of shown) {
+        const p = num(r.profit), c = num(r.cost), conv = num(r.conversions) | 0;
+        const cplStr = conv ? `$${(c / conv).toFixed(2)}`.padStart(6) : '   — ';
+        const spend = `$${c.toFixed(2)}`.padStart(8);
+        const name = fitName(nameFor(r));
+        lines.push(`${money(p, 9)} ${padL(conv, 4)} ${spend} ${cplStr}  ${name}`);
+        const s3 = String(r.sub3 || ''), s6 = String(r.sub6 || '');
+        if (s3 && s6 && s3 !== s6) {
+          lines.push(`${' '.repeat(9 + 1 + 4 + 1 + 8 + 1 + 6 + 2)}└ ${s3}`);
+        }
+      }
+      if (arr.length > shown.length) lines.push(`… +${arr.length - shown.length} aur`);
+      return escapeHtml(lines.join('\n'));
     };
 
     const time = timeInTZ(REPORT_TIMEZONE);
@@ -98,12 +100,26 @@ async function sendTelegramReport() {
       msg = `📊 ${today} ${time} ${REPORT_TIMEZONE}\nAbhi tak koi paid activity nahi today.`;
     } else {
       const sign = n => (n >= 0 ? '+' : '');
-      const emoji = tprof >= 0 ? '🟢' : '🔴';
-      msg  = `📊 <b>All Campaigns</b> · ${today} ${time} ${REPORT_TIMEZONE}\n`;
-      msg += `<b>Account:</b> spend $${tc.toFixed(2)} · conv ${tconv | 0} · rev $${trev.toFixed(2)}\n`;
-      msg += `${emoji} Profit <b>$${sign(tprof)}${tprof.toFixed(2)}</b> · ROI ${sign(roi)}${roi.toFixed(0)}% · CPL $${cpl.toFixed(2)} · AOV $${aov.toFixed(2)}\n`;
-      msg += renderSection('🟢 <b>Profitable</b>', profitable);
-      msg += renderSection('🔴 <b>Loss — consider pausing</b>', losses);
+      const headerTitle = REPORT_CAMPAIGN_ID
+        ? `Campaign ${REPORT_CAMPAIGN_ID.slice(0, 4)}…${REPORT_CAMPAIGN_ID.slice(-4)}`
+        : 'All Campaigns';
+      const totalsBlock =
+        `Spend    ${('$' + tc.toFixed(2)).padStart(10)}\n` +
+        `Conv     ${String(tconv | 0).padStart(10)}\n` +
+        `Rev      ${('$' + trev.toFixed(2)).padStart(10)}\n` +
+        `Profit   ${(sign(tprof) + '$' + tprof.toFixed(2)).padStart(10)}\n` +
+        `ROI      ${(sign(roi) + roi.toFixed(0) + '%').padStart(10)}\n` +
+        `CPL      ${('$' + cpl.toFixed(2)).padStart(10)}\n` +
+        `AOV      ${('$' + aov.toFixed(2)).padStart(10)}`;
+
+      msg  = `📊 <b>${escapeHtml(headerTitle)}</b> · ${today} ${time} ${REPORT_TIMEZONE}\n`;
+      msg += `<pre>${escapeHtml(totalsBlock)}</pre>\n`;
+      if (profitable.length) {
+        msg += `🟢 <b>Profitable (${profitable.length})</b>\n<pre>${renderTable(profitable)}</pre>\n`;
+      }
+      if (losses.length) {
+        msg += `🔴 <b>Loss — consider pausing (${losses.length})</b>\n<pre>${renderTable(losses)}</pre>`;
+      }
     }
     // Telegram hard limit is 4096 chars; trim safely if we ever exceed.
     if (msg.length > 4000) msg = msg.slice(0, 3990) + '\n… (truncated)';
