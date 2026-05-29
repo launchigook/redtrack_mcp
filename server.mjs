@@ -73,32 +73,69 @@ async function sendTelegramReport() {
       return s.length <= w ? s : s.slice(0, w - 1) + '…';
     };
     const money = (v, w = 8) => ((v >= 0 ? '+' : '') + `$${v.toFixed(2)}`).padStart(w);
-    const padL = (s, w) => String(s).padStart(w);
     const nameFor = r => r.campaign || r.campaign_name || r.sub6 || r.sub3 || r.campaign_id || '';
 
-    const renderTable = (arr) => {
-      const head = `${'Profit'.padStart(9)} ${'Conv'.padStart(4)} ${'Spend'.padStart(8)} ${'CPL'.padStart(6)}  Creative`;
-      const lines = [head, '─'.repeat(head.length)];
-      const shown = arr.slice(0, REPORT_MAX_PER_SECTION);
-      for (const r of shown) {
+    // Build the per-row text lines for a set of campaigns/creatives. Each row
+    // is one main line plus an optional sub3 sub-line.
+    const buildRowLines = (arr) => {
+      const out = [];
+      for (const r of arr) {
         const p = num(r.profit), c = num(r.cost), conv = num(r.conversions) | 0;
         const cplStr = conv ? `$${(c / conv).toFixed(2)}`.padStart(6) : '   — ';
         const spend = `$${c.toFixed(2)}`.padStart(8);
-        const name = fitName(nameFor(r));
-        lines.push(`${money(p, 9)} ${padL(conv, 4)} ${spend} ${cplStr}  ${name}`);
+        out.push(`${money(p, 9)} ${String(conv).padStart(4)} ${spend} ${cplStr}  ${fitName(nameFor(r))}`);
         const s3 = String(r.sub3 || ''), s6 = String(r.sub6 || '');
         if (s3 && s6 && s3 !== s6) {
-          lines.push(`${' '.repeat(9 + 1 + 4 + 1 + 8 + 1 + 6 + 2)}└ ${s3}`);
+          out.push(`${' '.repeat(9 + 1 + 4 + 1 + 8 + 1 + 6 + 2)}└ ${s3}`);
         }
       }
-      if (arr.length > shown.length) lines.push(`… +${arr.length - shown.length} aur`);
-      return escapeHtml(lines.join('\n'));
+      return out;
+    };
+
+    // Telegram sendMessage helper — POSTs one message, logs failures.
+    const tgSend = async (text) => {
+      const rsp = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true })
+      });
+      if (!rsp.ok) console.error('Telegram send failed:', rsp.status, (await rsp.text()).slice(0, 300));
+      return rsp.ok;
+    };
+
+    // Send a section's rows as one or more <pre> messages, splitting at row
+    // boundaries when the per-message char budget would be exceeded.
+    const COLUMN_HEADER = `   Profit Conv    Spend    CPL  Creative`;
+    const COLUMN_SEP    = '─'.repeat(COLUMN_HEADER.length);
+    const MSG_BUDGET    = 3800; // leave headroom under Telegram's 4096-char cap
+    const sendSection = async (titleHTML, rowLines, totalCount) => {
+      if (!rowLines.length) return;
+      const wrap = (titleSuffix, body) =>
+        `${titleHTML}${titleSuffix}\n<pre>${escapeHtml(COLUMN_HEADER)}\n${COLUMN_SEP}\n${escapeHtml(body)}</pre>`;
+      // Greedy pack rows into chunks. We pre-compute the empty wrap length so we
+      // know the per-chunk overhead and can decide when to flush.
+      const overhead = wrap(` (part ?/?)`, '').length;
+      const maxBody = MSG_BUDGET - overhead;
+      const chunks = [];
+      let buf = [], bufLen = 0;
+      for (const ln of rowLines) {
+        const add = ln.length + 1; // +1 for newline
+        if (bufLen + add > maxBody && buf.length) {
+          chunks.push(buf.join('\n'));
+          buf = []; bufLen = 0;
+        }
+        buf.push(ln); bufLen += add;
+      }
+      if (buf.length) chunks.push(buf.join('\n'));
+      for (let i = 0; i < chunks.length; i++) {
+        const suffix = chunks.length > 1 ? ` (part ${i + 1}/${chunks.length})` : '';
+        await tgSend(wrap(suffix, chunks[i]));
+      }
     };
 
     const time = timeInTZ(REPORT_TIMEZONE);
-    let msg;
     if (!active.length) {
-      msg = `📊 ${today} ${time} ${REPORT_TIMEZONE}\nAbhi tak koi paid activity nahi today.`;
+      await tgSend(`📊 ${today} ${time} ${REPORT_TIMEZONE}\nAbhi tak koi paid activity nahi today.`);
     } else {
       const sign = n => (n >= 0 ? '+' : '');
       const headerTitle = REPORT_CAMPAIGN_ID
@@ -113,28 +150,17 @@ async function sendTelegramReport() {
         `CPL      ${('$' + cpl.toFixed(2)).padStart(10)}\n` +
         `AOV      ${('$' + aov.toFixed(2)).padStart(10)}`;
 
-      msg  = `📊 <b>${escapeHtml(headerTitle)}</b> · ${today} ${time} ${REPORT_TIMEZONE}\n`;
-      msg += `<pre>${escapeHtml(totalsBlock)}</pre>\n`;
-      if (profitable.length) {
-        msg += `🟢 <b>Profitable (${profitable.length})</b>\n<pre>${renderTable(profitable)}</pre>\n`;
-      }
-      if (losses.length) {
-        msg += `🔴 <b>Loss — consider pausing (${losses.length})</b>\n<pre>${renderTable(losses)}</pre>`;
-      }
+      // Header + totals as the first message.
+      await tgSend(
+        `📊 <b>${escapeHtml(headerTitle)}</b> · ${today} ${time} ${REPORT_TIMEZONE}\n` +
+        `<pre>${escapeHtml(totalsBlock)}</pre>`
+      );
+      // Then every profitable creative (split across messages if needed).
+      await sendSection(`🟢 <b>Profitable (${profitable.length})</b>`, buildRowLines(profitable), profitable.length);
+      // Then every loss creative.
+      await sendSection(`🔴 <b>Loss — consider pausing (${losses.length})</b>`, buildRowLines(losses), losses.length);
     }
-    // Telegram hard limit is 4096 chars; trim safely if we ever exceed.
-    if (msg.length > 4000) msg = msg.slice(0, 3990) + '\n… (truncated)';
-
-    const rsp = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML', disable_web_page_preview: true })
-    });
-    if (!rsp.ok) {
-      console.error('Telegram send failed:', rsp.status, (await rsp.text()).slice(0, 300));
-    } else {
-      console.log(`Telegram report sent: ${active.length} active campaigns, profit $${tprof.toFixed(2)}`);
-    }
+    console.log(`Telegram report sent: ${active.length} rows (prof ${profitable.length}, loss ${losses.length}), profit $${tprof.toFixed(2)}`);
   } catch (err) {
     console.error('sendTelegramReport error:', err.message);
   }
