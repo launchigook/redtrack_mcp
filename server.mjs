@@ -12,9 +12,10 @@ import { runTool, getReport } from './redtrack.mjs';
 // ────────────────────────────────────────────────────────────────────────────
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT  = process.env.TELEGRAM_CHAT_ID;
-// REPORT_CAMPAIGN_ID is optional now — leave empty to report ALL campaigns.
-const REPORT_CAMPAIGN_ID  = process.env.REPORT_CAMPAIGN_ID || '';
-const REPORT_GROUP        = process.env.REPORT_GROUP || 'campaign';
+// Defaults pinned to the campaign + grouping the user actually wants reported.
+// Override via Railway env vars if needed; set REPORT_CAMPAIGN_ID="" to disable filter.
+const REPORT_CAMPAIGN_ID  = process.env.REPORT_CAMPAIGN_ID ?? '69ce350453a286805398f9a5';
+const REPORT_GROUP        = process.env.REPORT_GROUP || 'sub3,sub6';
 const REPORT_TIMEZONE     = process.env.REPORT_TIMEZONE || 'America/New_York';
 const REPORT_INTERVAL_MIN = parseInt(process.env.REPORT_INTERVAL_MIN || '15', 10);
 // Cap rows shown per section so the Telegram message stays under the 4096-char limit.
