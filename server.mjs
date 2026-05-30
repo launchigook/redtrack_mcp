@@ -28,12 +28,15 @@ const REPORT_MAX_PER_SECTION = parseInt(process.env.REPORT_MAX_PER_SECTION || '1
 //   active for ≥ PAUSE_MIN_HOURS    (derived from RedTrack hour_of_day)
 // When PAUSE_DRY_RUN=true (default), it only sends a "WOULD PAUSE" Telegram
 // alert instead of actually pausing — useful to validate the rule first.
-const PAUSE_ENABLED   = process.env.PAUSE_ENABLED === 'true';
-const PAUSE_DRY_RUN   = process.env.PAUSE_DRY_RUN !== 'false';
-const PAUSE_MIN_SPEND = parseFloat(process.env.PAUSE_MIN_SPEND || '5');
-const PAUSE_MIN_HOURS = parseInt(process.env.PAUSE_MIN_HOURS || '2', 10);
-const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN || '';
-const FB_API_VERSION  = process.env.FB_API_VERSION || 'v18.0';
+const PAUSE_ENABLED      = process.env.PAUSE_ENABLED === 'true';
+const PAUSE_DRY_RUN      = process.env.PAUSE_DRY_RUN !== 'false';
+const PAUSE_MIN_SPEND    = parseFloat(process.env.PAUSE_MIN_SPEND || '5');
+const PAUSE_MIN_HOURS    = parseInt(process.env.PAUSE_MIN_HOURS || '2', 10);
+// Windsor.ai is the action layer for FB pause. Get your key from windsor.ai dashboard.
+const WINDSOR_API_KEY    = process.env.WINDSOR_API_KEY || '';
+const WINDSOR_MCP_URL    = process.env.WINDSOR_MCP_URL || 'https://mcp.windsor.ai/';
+// The FB ad account ID as registered on Windsor (numeric act_<id> without "act_").
+const WINDSOR_FB_ACCOUNT = process.env.WINDSOR_FB_ACCOUNT || '513363970960565';
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -206,18 +209,47 @@ async function tgPost(text) {
   } catch (e) { console.error('tgPost error:', e.message); return false; }
 }
 
-// Pause an FB campaign via Marketing API.
-async function fbPauseCampaign(campaignId) {
-  if (!FB_ACCESS_TOKEN) throw new Error('FB_ACCESS_TOKEN not set');
-  const body = new URLSearchParams({ status: 'PAUSED', access_token: FB_ACCESS_TOKEN });
-  const rsp = await fetch(`https://graph.facebook.com/${FB_API_VERSION}/${encodeURIComponent(campaignId)}`, {
-    method: 'POST', body
+// Pause an FB campaign via Windsor.ai MCP (JSON-RPC tools/call → execute_action).
+// Endpoint: https://mcp.windsor.ai/  · Auth: Bearer <WINDSOR_API_KEY>
+async function windsorPauseCampaign(campaignId) {
+  if (!WINDSOR_API_KEY) throw new Error('WINDSOR_API_KEY not set');
+  const body = {
+    jsonrpc: '2.0',
+    id: Date.now(),
+    method: 'tools/call',
+    params: {
+      name: 'execute_action',
+      arguments: {
+        connector: 'facebook',
+        action: 'pause_campaign',
+        account: WINDSOR_FB_ACCOUNT,
+        params: { campaign_id: String(campaignId) }
+      }
+    }
+  };
+  const rsp = await fetch(WINDSOR_MCP_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      'Authorization': `Bearer ${WINDSOR_API_KEY}`
+    },
+    body: JSON.stringify(body)
   });
-  if (!rsp.ok) {
-    const t = await rsp.text();
-    throw new Error(`FB ${rsp.status}: ${t.slice(0, 200)}`);
+  const ct = rsp.headers.get('content-type') || '';
+  const text = await rsp.text();
+  if (!rsp.ok) throw new Error(`Windsor HTTP ${rsp.status}: ${text.slice(0, 250)}`);
+  // Streamable HTTP may return SSE-formatted body. Parse generously.
+  let json;
+  if (ct.includes('text/event-stream')) {
+    const dataLine = text.split('\n').find(l => l.startsWith('data:'));
+    if (!dataLine) throw new Error(`Windsor SSE: no data line in response: ${text.slice(0,200)}`);
+    json = JSON.parse(dataLine.slice(5).trim());
+  } else {
+    json = JSON.parse(text);
   }
-  return rsp.json();
+  if (json.error) throw new Error(`Windsor: ${json.error.message || JSON.stringify(json.error)}`);
+  return json.result;
 }
 
 // Determine how many hours a sub3 has been active today via RedTrack hour_of_day.
@@ -282,12 +314,12 @@ async function runAutoPause() {
       actions.push({ sub3, name, status: 'SKIP', reason: `active ${hours}h < ${PAUSE_MIN_HOURS}h`, cost });
       continue;
     }
-    if (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN) {
-      const why = !FB_ACCESS_TOKEN && !PAUSE_DRY_RUN ? '(no FB token set → forced dry-run)' : '';
+    if (PAUSE_DRY_RUN || !WINDSOR_API_KEY) {
+      const why = !WINDSOR_API_KEY && !PAUSE_DRY_RUN ? '(no WINDSOR_API_KEY → forced dry-run)' : '';
       actions.push({ sub3, name, status: 'WOULD-PAUSE', reason: `spend $${cost.toFixed(2)}, 0 conv, active ${hours}h ${why}`, cost });
     } else {
       try {
-        await fbPauseCampaign(sub3);
+        await windsorPauseCampaign(sub3);
         _pausedToday.add(sub3);
         actions.push({ sub3, name, status: 'PAUSED', reason: `spend $${cost.toFixed(2)}, 0 conv, active ${hours}h`, cost });
       } catch (e) {
@@ -298,7 +330,7 @@ async function runAutoPause() {
   if (!actions.length) return;
 
   const time = timeInTZ(REPORT_TIMEZONE);
-  const head = (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN)
+  const head = (PAUSE_DRY_RUN || !WINDSOR_API_KEY)
     ? `🤖 <b>Auto-pause check</b> · ${today} ${time}\n<i>DRY-RUN mode — no actual pauses</i>`
     : `🤖 <b>Auto-pause</b> · ${today} ${time}`;
   const icon = s => ({ PAUSED: '🛑', 'WOULD-PAUSE': '🟡', SKIP: '⏭️', ERROR: '⚠️' }[s] || '•');
@@ -319,8 +351,8 @@ function startReportScheduler() {
   setInterval(sendTelegramReport, REPORT_INTERVAL_MIN * 60 * 1000);
 
   if (PAUSE_ENABLED) {
-    const mode = (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN) ? 'DRY-RUN' : 'LIVE';
-    console.log(`Auto-pause enabled (${mode}): spend ≥ $${PAUSE_MIN_SPEND}, 0 conv, ≥ ${PAUSE_MIN_HOURS}h active`);
+    const mode = (PAUSE_DRY_RUN || !WINDSOR_API_KEY) ? 'DRY-RUN' : 'LIVE';
+    console.log(`Auto-pause enabled (${mode}): spend ≥ $${PAUSE_MIN_SPEND}, 0 conv, ≥ ${PAUSE_MIN_HOURS}h active · action=Windsor.ai`);
     setTimeout(runAutoPause, 25_000); // staggered shortly after first report
     setInterval(runAutoPause, REPORT_INTERVAL_MIN * 60 * 1000);
   } else {
