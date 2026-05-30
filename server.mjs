@@ -21,6 +21,20 @@ const REPORT_INTERVAL_MIN = parseInt(process.env.REPORT_INTERVAL_MIN || '15', 10
 // Cap rows shown per section so the Telegram message stays under the 4096-char limit.
 const REPORT_MAX_PER_SECTION = parseInt(process.env.REPORT_MAX_PER_SECTION || '10', 10);
 
+// ── Auto-pause config ──────────────────────────────────────────────────────
+// Pauses creatives that bleed without converting. Rule:
+//   today spend ≥ PAUSE_MIN_SPEND  AND
+//   today conversions == 0          AND
+//   active for ≥ PAUSE_MIN_HOURS    (derived from RedTrack hour_of_day)
+// When PAUSE_DRY_RUN=true (default), it only sends a "WOULD PAUSE" Telegram
+// alert instead of actually pausing — useful to validate the rule first.
+const PAUSE_ENABLED   = process.env.PAUSE_ENABLED === 'true';
+const PAUSE_DRY_RUN   = process.env.PAUSE_DRY_RUN !== 'false';
+const PAUSE_MIN_SPEND = parseFloat(process.env.PAUSE_MIN_SPEND || '5');
+const PAUSE_MIN_HOURS = parseInt(process.env.PAUSE_MIN_HOURS || '2', 10);
+const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN || '';
+const FB_API_VERSION  = process.env.FB_API_VERSION || 'v18.0';
+
 function escapeHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -170,6 +184,131 @@ async function sendTelegramReport() {
   }
 }
 
+// ── Auto-pause implementation ───────────────────────────────────────────────
+// In-memory dedupe: per-day set of sub3 IDs we've already paused this UTC date.
+// Resets when REPORT_TIMEZONE day rolls over. Resets on container restart too,
+// but FB pause is idempotent so worst case we re-issue a pause for an already-
+// paused campaign (which FB accepts as a no-op).
+const _pausedToday = new Set();
+let _pausedDate = '';
+
+// Lightweight tgPost — module-level helper used by auto-pause alerts.
+async function tgPost(text) {
+  if (!TG_TOKEN || !TG_CHAT) return false;
+  try {
+    const rsp = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true })
+    });
+    if (!rsp.ok) console.error('tgPost failed:', rsp.status, (await rsp.text()).slice(0, 200));
+    return rsp.ok;
+  } catch (e) { console.error('tgPost error:', e.message); return false; }
+}
+
+// Pause an FB campaign via Marketing API.
+async function fbPauseCampaign(campaignId) {
+  if (!FB_ACCESS_TOKEN) throw new Error('FB_ACCESS_TOKEN not set');
+  const body = new URLSearchParams({ status: 'PAUSED', access_token: FB_ACCESS_TOKEN });
+  const rsp = await fetch(`https://graph.facebook.com/${FB_API_VERSION}/${encodeURIComponent(campaignId)}`, {
+    method: 'POST', body
+  });
+  if (!rsp.ok) {
+    const t = await rsp.text();
+    throw new Error(`FB ${rsp.status}: ${t.slice(0, 200)}`);
+  }
+  return rsp.json();
+}
+
+// Determine how many hours a sub3 has been active today via RedTrack hour_of_day.
+async function getHoursActiveToday(sub3, today) {
+  try {
+    const rows = await getReport({
+      group: 'hour_of_day',
+      date_from: today, date_to: today,
+      campaign_id: REPORT_CAMPAIGN_ID,
+      sub3,
+      timezone: REPORT_TIMEZONE
+    });
+    if (!Array.isArray(rows) || !rows.length) return 0;
+    const hoursWithSpend = rows
+      .filter(r => Number(r.cost) > 0)
+      .map(r => parseInt(r.hour_of_day, 10))
+      .filter(h => !isNaN(h));
+    if (!hoursWithSpend.length) return 0;
+    const firstHour = Math.min(...hoursWithSpend);
+    const nowHourStr = new Intl.DateTimeFormat('en-US', {
+      timeZone: REPORT_TIMEZONE, hour: '2-digit', hour12: false
+    }).format(new Date());
+    const currentHour = parseInt(nowHourStr, 10);
+    return Math.max(0, currentHour - firstHour + 1);
+  } catch (e) {
+    console.error('getHoursActiveToday error:', e.message);
+    return 0;
+  }
+}
+
+async function runAutoPause() {
+  if (!PAUSE_ENABLED) return;
+  const today = todayInTZ(REPORT_TIMEZONE);
+  if (today !== _pausedDate) { _pausedToday.clear(); _pausedDate = today; }
+
+  let rows;
+  try {
+    rows = await getReport({
+      group: 'sub3,sub6',
+      date_from: today, date_to: today,
+      campaign_id: REPORT_CAMPAIGN_ID,
+      timezone: REPORT_TIMEZONE,
+      sortby: 'profit', direction: 'asc'
+    });
+  } catch (e) {
+    console.error('auto-pause report fetch failed:', e.message);
+    return;
+  }
+  const num = v => Number(v) || 0;
+  const candidates = (Array.isArray(rows) ? rows : []).filter(r =>
+    num(r.cost) >= PAUSE_MIN_SPEND && num(r.conversions) === 0 && r.sub3
+  );
+
+  const actions = [];
+  for (const r of candidates) {
+    const sub3 = String(r.sub3);
+    if (_pausedToday.has(sub3)) continue;
+    const hours = await getHoursActiveToday(sub3, today);
+    const cost = num(r.cost);
+    const name = trim(String(r.sub6 || r.sub3 || '(untagged)'), 50);
+    if (hours < PAUSE_MIN_HOURS) {
+      actions.push({ sub3, name, status: 'SKIP', reason: `active ${hours}h < ${PAUSE_MIN_HOURS}h`, cost });
+      continue;
+    }
+    if (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN) {
+      const why = !FB_ACCESS_TOKEN && !PAUSE_DRY_RUN ? '(no FB token set → forced dry-run)' : '';
+      actions.push({ sub3, name, status: 'WOULD-PAUSE', reason: `spend $${cost.toFixed(2)}, 0 conv, active ${hours}h ${why}`, cost });
+    } else {
+      try {
+        await fbPauseCampaign(sub3);
+        _pausedToday.add(sub3);
+        actions.push({ sub3, name, status: 'PAUSED', reason: `spend $${cost.toFixed(2)}, 0 conv, active ${hours}h`, cost });
+      } catch (e) {
+        actions.push({ sub3, name, status: 'ERROR', reason: e.message, cost });
+      }
+    }
+  }
+  if (!actions.length) return;
+
+  const time = timeInTZ(REPORT_TIMEZONE);
+  const head = (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN)
+    ? `🤖 <b>Auto-pause check</b> · ${today} ${time}\n<i>DRY-RUN mode — no actual pauses</i>`
+    : `🤖 <b>Auto-pause</b> · ${today} ${time}`;
+  const icon = s => ({ PAUSED: '🛑', 'WOULD-PAUSE': '🟡', SKIP: '⏭️', ERROR: '⚠️' }[s] || '•');
+  const lines = actions.map(a =>
+    `${icon(a.status)} <b>${a.status}</b>: ${escapeHtml(a.name)}\n   ${escapeHtml(a.reason)}\n   <code>sub3: ${escapeHtml(a.sub3)}</code>`
+  );
+  await tgPost(`${head}\n\n${lines.join('\n')}`);
+  console.log(`Auto-pause: ${actions.length} actions (${actions.filter(a => a.status === 'PAUSED').length} paused, ${actions.filter(a => a.status === 'WOULD-PAUSE').length} would-pause, ${actions.filter(a => a.status === 'SKIP').length} skipped)`);
+}
+
 function startReportScheduler() {
   if (!TG_TOKEN || !TG_CHAT) {
     console.log('Report scheduler disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)');
@@ -178,6 +317,15 @@ function startReportScheduler() {
   console.log(`Report scheduler enabled: every ${REPORT_INTERVAL_MIN} min · campaign=${REPORT_CAMPAIGN_ID} · tz=${REPORT_TIMEZONE}`);
   setTimeout(sendTelegramReport, 10_000); // first run shortly after startup
   setInterval(sendTelegramReport, REPORT_INTERVAL_MIN * 60 * 1000);
+
+  if (PAUSE_ENABLED) {
+    const mode = (PAUSE_DRY_RUN || !FB_ACCESS_TOKEN) ? 'DRY-RUN' : 'LIVE';
+    console.log(`Auto-pause enabled (${mode}): spend ≥ $${PAUSE_MIN_SPEND}, 0 conv, ≥ ${PAUSE_MIN_HOURS}h active`);
+    setTimeout(runAutoPause, 25_000); // staggered shortly after first report
+    setInterval(runAutoPause, REPORT_INTERVAL_MIN * 60 * 1000);
+  } else {
+    console.log('Auto-pause disabled (set PAUSE_ENABLED=true on Railway to enable)');
+  }
 }
 
 // Helper to support both simple and JSON-RPC 2.0 payloads
